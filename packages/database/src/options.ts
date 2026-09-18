@@ -26,6 +26,7 @@ export function buildDataSourceOptions(env: DatabaseEnv = process.env): DataSour
     username: env.DB_USER ?? 'questionnaire',
     password: env.DB_PASSWORD ?? 'questionnaire',
     ssl: env.DB_SSL === 'true' ? 'Amazon RDS' : undefined,
+    connectTimeout: 60_000,
     timezone: 'Z',
     charset: 'utf8mb4',
     entities: ENTITIES,
