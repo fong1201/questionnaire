@@ -32,7 +32,6 @@
   "frontend": {
     "PriceClass": "PriceClass_200",
     "QuestionnaireDomainName": "",
-    "DashboardDomainName": "",
-    "CertificateArn": ""
+    "DashboardDomainName": ""
   }
 }

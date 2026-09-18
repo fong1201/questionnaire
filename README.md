@@ -326,7 +326,7 @@ Pull requests run only CI, which also checks that the Docker images build.
 
 - **Alarm emails:** set `messaging.AlarmEmail` to receive queue alarms by email. Confirm the
   subscription email that AWS sends.
-- **Custom domains:** set `QuestionnaireDomainName`, `DashboardDomainName` and `CertificateArn`.
+- **Custom domains:** set `QuestionnaireDomainName`, `DashboardDomainName`.
   The certificate must be an ACM certificate in `us-east-1`. Then point DNS at the CloudFront domains.
 - **Idle pausing:** with a minimum capacity of 0, the first request after an idle period waits about
   15 seconds while Aurora resumes. Set `MinCapacity` to `0.5` to avoid that.

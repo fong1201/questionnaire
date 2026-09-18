@@ -20,10 +20,6 @@ Parameters:
     Type: String
     Default: ''
     Description: Optional custom domain for the dashboard app, e.g. dashboard.example.com
-  CertificateArn:
-    Type: String
-    Default: ''
-    Description: ACM certificate in us-east-1 covering the custom domains. Required if any domain is set.
   PriceClass:
     Type: String
     Default: PriceClass_200
@@ -147,10 +143,8 @@ Resources:
         PriceClass: !Ref PriceClass
         DefaultRootObject: index.html
         Aliases: !If [HasQuestionnaireDomain, [!Ref QuestionnaireDomainName], !Ref AWS::NoValue]
-        ViewerCertificate: !If
-          - HasQuestionnaireDomain
-          - { AcmCertificateArn: !Ref CertificateArn, SslSupportMethod: sni-only, MinimumProtocolVersion: TLSv1.2_2021 }
-          - { CloudFrontDefaultCertificate: true }
+        ViewerCertificate: 
+          CloudFrontDefaultCertificate: true
         Origins:
           - Id: web
             DomainName: !GetAtt QuestionnaireBucket.RegionalDomainName
@@ -233,10 +227,8 @@ Resources:
         PriceClass: !Ref PriceClass
         DefaultRootObject: index.html
         Aliases: !If [HasDashboardDomain, [!Ref DashboardDomainName], !Ref AWS::NoValue]
-        ViewerCertificate: !If
-          - HasDashboardDomain
-          - { AcmCertificateArn: !Ref CertificateArn, SslSupportMethod: sni-only, MinimumProtocolVersion: TLSv1.2_2021 }
-          - { CloudFrontDefaultCertificate: true }
+        ViewerCertificate: 
+          CloudFrontDefaultCertificate: true
         Origins:
           - Id: web
             DomainName: !GetAtt DashboardBucket.RegionalDomainName
