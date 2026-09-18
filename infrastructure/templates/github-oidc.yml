@@ -62,7 +62,9 @@ Resources:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
                 # Only jobs that run in a GitHub environment of this repository (dev, staging, prod).
-                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOwner}/${GitHubRepository}:environment:*'
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubOwner}/${GitHubRepository}:environment:*"
+                  - !Sub "repo:${GitHubOwner}@*/${GitHubRepository}@*:environment:*"
       Policies:
         - PolicyName: deploy
           PolicyDocument:
