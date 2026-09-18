@@ -1,0 +1,38 @@
+{
+  "region": "ap-east-1",
+  "network": {
+    "VpcCidr": "10.20.0.0/16"
+  },
+  "ecr": {
+    "ImagesToKeep": "20"
+  },
+  "messaging": {
+    "AlarmEmail": "",
+    "BacklogAlarmSeconds": "300"
+  },
+  "database": {
+    "MinCapacity": "0",
+    "MaxCapacity": "2",
+    "SecondsUntilAutoPause": "900",
+    "ReaderInstance": "false",
+    "BackupRetentionPeriod": "1",
+    "DeletionProtection": "false"
+  },
+  "backend": {
+    "TaskCpu": "256",
+    "TaskMemory": "512",
+    "QuestionnaireApiMinCount": "1",
+    "QuestionnaireApiMaxCount": "2",
+    "DashboardApiMinCount": "1",
+    "DashboardApiMaxCount": "1",
+    "VoteWorkerMinCount": "1",
+    "VoteWorkerMaxCount": "2",
+    "LogRetentionDays": "14"
+  },
+  "frontend": {
+    "PriceClass": "PriceClass_200",
+    "QuestionnaireDomainName": "",
+    "DashboardDomainName": "",
+    "CertificateArn": ""
+  }
+}

@@ -1,0 +1,116 @@
+# Full stack on one machine:  ./scripts/install.sh   (or: docker compose up -d --build)
+#   Questionnaire  http://localhost:8080
+#   Dashboard      http://localhost:8081
+#   Queue UI       http://localhost:9325
+name: questionnaire
+
+x-sqs-env: &sqs-env
+  AWS_REGION: ap-east-1
+  SQS_ENDPOINT: http://elasticmq:9324
+  SQS_QUEUE_URL: http://elasticmq:9324/000000000000/votes
+
+x-db-env: &db-env
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_NAME: questionnaire
+  DB_USER: questionnaire
+  DB_PASSWORD: questionnaire
+  DB_SSL: "false"
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: questionnaire
+      MYSQL_USER: questionnaire
+      MYSQL_PASSWORD: questionnaire
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.7.1
+    ports:
+      - "${SQS_PORT:-9324}:9324"
+    volumes:
+      - ./docker/elasticmq.conf:/opt/elasticmq.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:9324/?Action=ListQueues' | grep -q votes"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Web UI for the local queue (browse queues, peek and send messages): http://localhost:9325
+  elasticmq-ui:
+    image: softwaremill/elasticmq-ui:1.7.1
+    environment:
+      SQS_ENDPOINT: http://elasticmq:9324
+      AWS_REGION: ap-east-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    ports:
+      - "${SQS_UI_PORT:-9325}:3000"
+    depends_on:
+      elasticmq: { condition: service_healthy }
+
+  migrate:
+    build: { context: ., dockerfile: backend/vote-worker/Dockerfile }
+    image: questionnaire/vote-worker:local
+    command: ["node", "/repo/packages/database/dist/migrate.js"]
+    environment: *db-env
+    depends_on:
+      mysql: { condition: service_healthy }
+    restart: "no"
+
+  questionnaire-api:
+    build: { context: ., dockerfile: backend/questionnaire-api/Dockerfile }
+    image: questionnaire/questionnaire-api:local
+    environment:
+      <<: *sqs-env
+    depends_on:
+      elasticmq: { condition: service_healthy }
+
+  vote-worker:
+    image: questionnaire/vote-worker:local
+    environment:
+      <<: [*sqs-env, *db-env]
+      WORKER_CONCURRENCY: "4"
+      DB_POOL_SIZE: "5"
+    deploy:
+      replicas: 2
+    depends_on:
+      elasticmq: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+
+  dashboard-api:
+    build: { context: ., dockerfile: backend/dashboard-api/Dockerfile }
+    image: questionnaire/dashboard-api:local
+    environment:
+      <<: *db-env
+      STATS_CACHE_SECONDS: "2"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_DASHBOARD_URL: http://localhost:${DASHBOARD_PORT:-8081}
+    image: questionnaire/web:local
+    ports:
+      - "${QUESTIONNAIRE_PORT:-8080}:8080"
+      - "${DASHBOARD_PORT:-8081}:8081"
+    depends_on:
+      - questionnaire-api
+      - dashboard-api
+
+volumes:
+  mysql-data:

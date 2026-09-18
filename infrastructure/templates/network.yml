@@ -1,0 +1,362 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Questionnaire - network. VPC with public subnets (load balancer, ECS tasks) and isolated
+  private subnets (Aurora), plus least-privilege security groups between the components.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: questionnaire
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+  CloudFrontPrefixListId:
+    Type: String
+    Description: >-
+      Managed prefix list id of com.amazonaws.global.cloudfront.origin-facing in this region.
+      Only CloudFront may reach the load balancer. The deploy script looks it up.
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}' }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}' }
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 12]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-a' }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 12]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public-b' }
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 12]]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-a' }
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 12]]
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private-b' }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-public' }
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetA
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetB
+
+  # Private subnets have no route to the internet: only the database lives there.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-private' }
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetA
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetB
+
+  # ------------------------------------------------------------------ security groups
+  # One group per component. Rules reference groups, not CIDRs, and outbound traffic is
+  # restricted too (SecurityGroupEgress on a group replaces the default allow-all rule).
+  #
+  #   CloudFront --80--> LoadBalancer --3000--> QuestionnaireApi --443--> SQS
+  #                                   --3000--> DashboardApi -----3306--> Database
+  #                        VoteWorker (no inbound) --443--> SQS, --3306--> Database
+  #   RotationLambda (private subnets) --443--> Secrets Manager endpoint, --3306--> Database
+  #   All tasks also use 443 for ECR, Secrets Manager and CloudWatch Logs.
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load balancer - HTTP from CloudFront origin-facing addresses only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: CloudFront origin-facing
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+      SecurityGroupEgress:
+        - Description: Questionnaire API tasks
+          IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          DestinationSecurityGroupId: !Ref QuestionnaireApiSecurityGroup
+        - Description: Dashboard API tasks
+          IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          DestinationSecurityGroupId: !Ref DashboardApiSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-alb' }
+
+  QuestionnaireApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: questionnaire-api tasks - no database access
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - Description: AWS APIs (SQS, ECR, Secrets Manager, CloudWatch Logs)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-questionnaire-api' }
+
+  QuestionnaireApiFromLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref QuestionnaireApiSecurityGroup
+      Description: Load balancer
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  DashboardApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: dashboard-api tasks
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - Description: AWS APIs (ECR, Secrets Manager, CloudWatch Logs)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-dashboard-api' }
+
+  DashboardApiFromLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DashboardApiSecurityGroup
+      Description: Load balancer
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  DashboardApiToDatabase:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref DashboardApiSecurityGroup
+      Description: Aurora MySQL
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+
+  # Also used by the one-off migration task.
+  VoteWorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: vote-worker and migration tasks - no inbound traffic
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - Description: AWS APIs (SQS, ECR, Secrets Manager, CloudWatch Logs)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-vote-worker' }
+
+  VoteWorkerToDatabase:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref VoteWorkerSecurityGroup
+      Description: Aurora MySQL
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+
+  # Secrets Manager's rotation function runs in the private subnets to reach Aurora.
+  RotationLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Database password rotation function - no inbound traffic
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - Description: Secrets Manager VPC endpoint
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-db-rotation' }
+
+  RotationLambdaToDatabase:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref RotationLambdaSecurityGroup
+      Description: Aurora MySQL
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+
+  # Private subnets have no internet route, so the rotation function reaches Secrets Manager
+  # through this endpoint. With private DNS on, ECS tasks in this VPC use it too (for injecting
+  # the database secret), which keeps that traffic inside AWS's network.
+  SecretsManagerEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Secrets Manager VPC endpoint - HTTPS from inside the VPC
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: Anything in this VPC
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+      SecurityGroupEgress:
+        - Description: No outbound traffic (placeholder rule replaces the default allow-all)
+          IpProtocol: icmp
+          FromPort: 252
+          ToPort: 86
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-secretsmanager-endpoint' }
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref SecretsManagerEndpointSecurityGroup]
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora MySQL - from vote-worker, dashboard-api and the rotation function only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: vote-worker and migration tasks
+          IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref VoteWorkerSecurityGroup
+        - Description: dashboard-api tasks
+          IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref DashboardApiSecurityGroup
+        - Description: password rotation function
+          IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref RotationLambdaSecurityGroup
+      SecurityGroupEgress:
+        - Description: No outbound traffic (placeholder rule replaces the default allow-all)
+          IpProtocol: icmp
+          FromPort: 252
+          ToPort: 86
+          CidrIp: 127.0.0.1/32
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-database' }
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub '${ProjectName}-${Environment}-VpcId' }
+  PublicSubnetIds:
+    Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Export: { Name: !Sub '${ProjectName}-${Environment}-PublicSubnetIds' }
+  PrivateSubnetIds:
+    Value: !Join [',', [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+    Export: { Name: !Sub '${ProjectName}-${Environment}-PrivateSubnetIds' }
+  LoadBalancerSecurityGroupId:
+    Value: !Ref LoadBalancerSecurityGroup
+    Export: { Name: !Sub '${ProjectName}-${Environment}-LoadBalancerSecurityGroupId' }
+  QuestionnaireApiSecurityGroupId:
+    Value: !Ref QuestionnaireApiSecurityGroup
+    Export: { Name: !Sub '${ProjectName}-${Environment}-QuestionnaireApiSecurityGroupId' }
+  DashboardApiSecurityGroupId:
+    Value: !Ref DashboardApiSecurityGroup
+    Export: { Name: !Sub '${ProjectName}-${Environment}-DashboardApiSecurityGroupId' }
+  VoteWorkerSecurityGroupId:
+    Value: !Ref VoteWorkerSecurityGroup
+    Export: { Name: !Sub '${ProjectName}-${Environment}-VoteWorkerSecurityGroupId' }
+  DatabaseSecurityGroupId:
+    Value: !Ref DatabaseSecurityGroup
+    Export: { Name: !Sub '${ProjectName}-${Environment}-DatabaseSecurityGroupId' }
+  RotationLambdaSecurityGroupId:
+    Value: !Ref RotationLambdaSecurityGroup
+    Export: { Name: !Sub '${ProjectName}-${Environment}-RotationLambdaSecurityGroupId' }

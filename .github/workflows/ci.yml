@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    name: Lint, test and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm run lint
+      - run: npm test
+
+      # The web apps call the API on their own origin, so one build serves every environment.
+      - name: Upload web builds
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-dist
+          path: |
+            frontend/questionnaire-web/dist
+            frontend/dashboard-web/dist
+          retention-days: 7
+
+  infrastructure:
+    name: Validate infrastructure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: pipx install cfn-lint
+      - run: cfn-lint --regions ap-east-1 -- infrastructure/templates/*.yml
+      - run: shellcheck infrastructure/scripts/*.sh
+
+  docker:
+    name: Build ${{ matrix.service }} image
+    # Deploys build and push images themselves; this only checks that pull requests still build.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [questionnaire-api, dashboard-api, vote-worker]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: backend/${{ matrix.service }}/Dockerfile
+          push: false
+          cache-from: type=gha,scope=${{ matrix.service }}

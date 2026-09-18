@@ -1,0 +1,153 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+# Never run two deployments of the same environment at once, and never cancel one halfway.
+concurrency:
+  group: deploy-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  infra:
+    name: Infrastructure
+    timeout-minutes: 90
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve region
+        run: echo "AWS_REGION=$(jq -r .region "infrastructure/environments/$ENVIRONMENT.json")" >> "$GITHUB_ENV"
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # The first run creates Aurora and its rotation function, which can take a while.
+          role-duration-seconds: 7200
+      - run: infrastructure/scripts/deploy.sh "$ENVIRONMENT" infra
+
+  images:
+    name: Push ${{ matrix.service }} image
+    timeout-minutes: 30
+    needs: infra
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - service: questionnaire-api
+            output: QuestionnaireApiRepositoryUri
+          - service: dashboard-api
+            output: DashboardApiRepositoryUri
+          - service: vote-worker
+            output: VoteWorkerRepositoryUri
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve region
+        run: echo "AWS_REGION=$(jq -r .region "infrastructure/environments/$ENVIRONMENT.json")" >> "$GITHUB_ENV"
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Resolve repository
+        id: repo
+        run: echo "uri=$(infrastructure/scripts/deploy.sh "$ENVIRONMENT" output ecr ${{ matrix.output }})" >> "$GITHUB_OUTPUT"
+
+      # Tags are immutable in ECR, so a re-run of the same commit skips the push.
+      - name: Check for existing image
+        id: exists
+        run: |
+          repo="${{ steps.repo.outputs.uri }}"
+          if aws ecr describe-images --repository-name "${repo#*/}" --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/build-push-action@v7
+        if: steps.exists.outputs.found != 'true'
+        with:
+          context: .
+          file: backend/${{ matrix.service }}/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.repo.outputs.uri }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  backend:
+    name: Migrate and deploy services
+    timeout-minutes: 90
+    needs: images
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve region
+        run: echo "AWS_REGION=$(jq -r .region "infrastructure/environments/$ENVIRONMENT.json")" >> "$GITHUB_ENV"
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 7200
+      - run: infrastructure/scripts/deploy.sh "$ENVIRONMENT" backend "$IMAGE_TAG"
+
+  frontend:
+    name: Deploy web apps
+    timeout-minutes: 45
+    needs: backend
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: web-dist
+          path: frontend
+      - name: Resolve region
+        run: echo "AWS_REGION=$(jq -r .region "infrastructure/environments/$ENVIRONMENT.json")" >> "$GITHUB_ENV"
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: infrastructure/scripts/deploy.sh "$ENVIRONMENT" frontend
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed \`$IMAGE_TAG\` to **$ENVIRONMENT**"
+            echo "- Questionnaire: $(infrastructure/scripts/deploy.sh "$ENVIRONMENT" output frontend QuestionnaireUrl)"
+            echo "- Dashboard: $(infrastructure/scripts/deploy.sh "$ENVIRONMENT" output frontend DashboardUrl)"
+          } >> "$GITHUB_STEP_SUMMARY"

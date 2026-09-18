@@ -1,0 +1,156 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Questionnaire - one-time bootstrap (deploy manually, once per AWS account). Lets GitHub Actions
+  assume a deploy role through OIDC (no long-lived keys) and gives CloudFormation its own
+  execution role, so the GitHub role itself cannot create arbitrary resources.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: questionnaire
+  GitHubOwner:
+    Type: String
+    Description: GitHub organisation or user that owns the repository
+  GitHubRepository:
+    Type: String
+    Description: Repository name (without the owner)
+  CreateOidcProvider:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Set to false if token.actions.githubusercontent.com already exists in this account.
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, 'true']
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  # Used by CloudFormation only (passed with --role-arn). Tighten to the services you use if needed.
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-cloudformation-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-github-deploy'
+      MaxSessionDuration: 7200
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # Only jobs that run in a GitHub environment of this repository (dev, staging, prod).
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOwner}/${GitHubRepository}:environment:*'
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudFormationStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DeleteStack
+                  - cloudformation:TagResource
+                  - cloudformation:UntagResource
+                Resource: !Sub 'arn:aws:cloudformation:*:${AWS::AccountId}:stack/${ProjectName}-*/*'
+              # database.yml uses this AWS transform to create the password rotation function.
+              - Sid: SecretsManagerRotationTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: 'arn:aws:cloudformation:*:aws:transform/SecretsManager-2024-09-16'
+              - Sid: CloudFormationGlobal
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListExports
+                  - cloudformation:GetTemplateSummary
+                Resource: '*'
+              - Sid: PassExecutionRoleToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationExecutionRole.Arn
+                Condition:
+                  StringEquals: { iam:PassedToService: cloudformation.amazonaws.com }
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: !Sub 'arn:aws:ecr:*:${AWS::AccountId}:repository/${ProjectName}-*'
+              - Sid: FrontendBuckets
+                Effect: Allow
+                Action: [s3:ListBucket, s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-*-web-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-*-web-${AWS::AccountId}/*'
+              - Sid: CloudFrontInvalidation
+                Effect: Allow
+                Action: [cloudfront:CreateInvalidation, cloudfront:GetInvalidation]
+                Resource: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/*'
+              - Sid: RunMigrationTask
+                Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub 'arn:aws:ecs:*:${AWS::AccountId}:task-definition/${ProjectName}-*-migrate:*'
+              - Sid: WatchEcs
+                Effect: Allow
+                Action: [ecs:DescribeTasks, ecs:DescribeServices]
+                Resource: '*'
+              - Sid: PassTaskRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*'
+                Condition:
+                  StringEquals: { iam:PassedToService: ecs-tasks.amazonaws.com }
+              - Sid: Lookups
+                Effect: Allow
+                Action: ec2:DescribeManagedPrefixLists
+                Resource: '*'
+              - Sid: ReadMigrationLogs
+                Effect: Allow
+                Action: [logs:FilterLogEvents, logs:GetLogEvents, logs:DescribeLogStreams]
+                Resource: !Sub 'arn:aws:logs:*:${AWS::AccountId}:log-group:/ecs/${ProjectName}-*'
+
+Outputs:
+  GitHubDeployRoleArn:
+    Description: Set this as the AWS_DEPLOY_ROLE_ARN variable in each GitHub environment
+    Value: !GetAtt GitHubDeployRole.Arn
+  CloudFormationExecutionRoleArn:
+    Value: !GetAtt CloudFormationExecutionRole.Arn

@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: '2010-09-09'
+# Required by HostedRotationLambda: expands into a nested stack with the rotation function.
+Transform: AWS::SecretsManager-2024-09-16
+Description: >-
+  Questionnaire - Aurora MySQL Serverless v2 (MySQL 8.4 compatible) in the isolated private
+  subnets. Credentials are generated into AWS Secrets Manager, rotated monthly, and never appear
+  in templates, parameters or source code. TLS is required for every connection.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: questionnaire
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  DatabaseName:
+    Type: String
+    Default: questionnaire
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9_]*'
+  MasterUsername:
+    Type: String
+    Default: questionnaire_admin
+  EngineVersion:
+    Type: String
+    Default: 8.4.mysql_aurora.8.4.8
+    Description: Aurora MySQL version (8.4-compatible, same as the local MySQL 8.4 container).
+  MinCapacity:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 256
+    Description: Minimum Aurora capacity units. 0 lets the cluster pause when idle (first request then waits ~15 s).
+  MaxCapacity:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 256
+  SecondsUntilAutoPause:
+    Type: Number
+    Default: 900
+    MinValue: 300
+    MaxValue: 86400
+    Description: Idle time before pausing. Only used when MinCapacity is 0.
+  ReaderInstance:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Adds a second instance in another AZ: automatic failover target and the dashboard's read
+      endpoint. Without it, the reader endpoint points at the writer.
+  BackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+  DeletionProtection:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  RotationScheduleExpression:
+    Type: String
+    Default: cron(0 19 1 * ? *)
+    Description: >-
+      When the password rotates (UTC). Default: monthly, 19:00 UTC on the 1st = 03:00 HKT on the 2nd.
+  RotationSubnetIds:
+    Type: String
+    Description: Comma separated private subnet ids for the rotation function (from the network stack).
+  RotationSecurityGroupId:
+    Type: String
+    Description: Security group of the rotation function (from the network stack).
+
+Conditions:
+  CreateReader: !Equals [!Ref ReaderInstance, 'true']
+  CanPause: !Equals [!Ref MinCapacity, '0']
+
+Resources:
+  # Generated password stored in Secrets Manager; the cluster reads it through a dynamic reference
+  # on creation, and RotationSchedule below changes it monthly afterwards. ECS injects the secret
+  # when a task starts; tasks that hit "access denied" after a rotation restart themselves.
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/${Environment}/database'
+      Description: !Sub 'Aurora MySQL credentials for ${ProjectName}-${Environment}'
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${MasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\`'''
+
+  SubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${ProjectName}-${Environment} database subnets'
+      SubnetIds: !Split [',', !ImportValue { 'Fn::Sub': '${ProjectName}-${Environment}-PrivateSubnetIds' }]
+
+  ClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: !Sub '${ProjectName}-${Environment} Aurora MySQL 8.4 parameters'
+      Family: aurora-mysql8.4
+      Parameters:
+        require_secure_transport: 'ON'
+        tls_version: TLSv1.2,TLSv1.3
+        character_set_server: utf8mb4
+        collation_server: utf8mb4_0900_ai_ci
+        time_zone: UTC
+
+  Cluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub '${ProjectName}-${Environment}'
+      Engine: aurora-mysql
+      EngineVersion: !Ref EngineVersion
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref SubnetGroup
+      DBClusterParameterGroupName: !Ref ClusterParameterGroup
+      VpcSecurityGroupIds:
+        - !ImportValue { 'Fn::Sub': '${ProjectName}-${Environment}-DatabaseSecurityGroupId' }
+      StorageEncrypted: true
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      PreferredBackupWindow: '18:00-19:00'
+      PreferredMaintenanceWindow: 'sun:19:30-sun:20:30'
+      DeletionProtection: !Ref DeletionProtection
+      CopyTagsToSnapshot: true
+      EnableCloudwatchLogsExports: [error, slowquery]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: !Ref MaxCapacity
+        SecondsUntilAutoPause: !If [CanPause, !Ref SecondsUntilAutoPause, !Ref AWS::NoValue]
+
+  WriterInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref Cluster
+      DBInstanceIdentifier: !Sub '${ProjectName}-${Environment}-1'
+      DBInstanceClass: db.serverless
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      PromotionTier: 0
+      AutoMinorVersionUpgrade: true
+
+  ReaderInstanceResource:
+    Type: AWS::RDS::DBInstance
+    Condition: CreateReader
+    DependsOn: WriterInstance
+    Properties:
+      DBClusterIdentifier: !Ref Cluster
+      DBInstanceIdentifier: !Sub '${ProjectName}-${Environment}-2'
+      DBInstanceClass: db.serverless
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      PromotionTier: 1
+      AutoMinorVersionUpgrade: true
+
+  # Adds engine, host and port to the secret, so it fully describes the connection.
+  SecretClusterAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DatabaseSecret
+      TargetId: !Ref Cluster
+      TargetType: AWS::RDS::DBCluster
+
+  # Monthly rotation with the AWS-provided MySQL single-user function. It runs in the private
+  # subnets, logs in with the current password, sets a new one and verifies it.
+  RotationSchedule:
+    Type: AWS::SecretsManager::RotationSchedule
+    DependsOn: [SecretClusterAttachment, WriterInstance]
+    Properties:
+      SecretId: !Ref DatabaseSecret
+      # Deploys never rotate by surprise: only the schedule does.
+      RotateImmediatelyOnUpdate: false
+      HostedRotationLambda:
+        RotationType: MySQLSingleUser
+        RotationLambdaName: !Sub '${ProjectName}-${Environment}-db-password-rotation'
+        VpcSubnetIds: !Ref RotationSubnetIds
+        VpcSecurityGroupIds: !Ref RotationSecurityGroupId
+        ExcludeCharacters: '"@/\`'''
+      RotationRules:
+        ScheduleExpression: !Ref RotationScheduleExpression
+        Duration: 2h
+
+Outputs:
+  WriterEndpoint:
+    Description: Used by vote-worker and migrations
+    Value: !GetAtt Cluster.Endpoint.Address
+    Export: { Name: !Sub '${ProjectName}-${Environment}-DatabaseWriterEndpoint' }
+  ReaderEndpoint:
+    Description: Used by dashboard-api (falls back to the writer when there is no reader instance)
+    Value: !GetAtt Cluster.ReadEndpoint.Address
+    Export: { Name: !Sub '${ProjectName}-${Environment}-DatabaseReaderEndpoint' }
+  DatabasePort:
+    Value: !GetAtt Cluster.Endpoint.Port
+    Export: { Name: !Sub '${ProjectName}-${Environment}-DatabasePort' }
+  DatabaseName:
+    Value: !Ref DatabaseName
+    Export: { Name: !Sub '${ProjectName}-${Environment}-DatabaseName' }
+  DatabaseSecretArn:
+    Description: Secrets Manager secret with username, password, host and port
+    Value: !Ref DatabaseSecret
+    Export: { Name: !Sub '${ProjectName}-${Environment}-DatabaseSecretArn' }

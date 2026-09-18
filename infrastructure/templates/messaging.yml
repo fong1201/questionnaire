@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Questionnaire - vote queue. The questionnaire API publishes each ballot here and returns 202;
+  vote workers consume it at their own pace, so traffic spikes never hit the database directly.
+  Messages that keep failing move to a dead-letter queue and raise an alarm.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: questionnaire
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  VisibilityTimeoutSeconds:
+    Type: Number
+    Default: 60
+    Description: Time a worker has to write a batch before the messages become visible again.
+  MaxReceiveCount:
+    Type: Number
+    Default: 5
+    Description: Deliveries before a message is moved to the dead-letter queue.
+  BacklogAlarmSeconds:
+    Type: Number
+    Default: 300
+    Description: Alarm when the oldest queued ballot is older than this.
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional address subscribed to queue alarms (confirm the subscription email).
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-votes-dlq'
+      MessageRetentionPeriod: 1209600 # 14 days, the maximum
+      SqsManagedSseEnabled: true
+
+  VoteQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-votes'
+      VisibilityTimeout: !Ref VisibilityTimeoutSeconds
+      ReceiveMessageWaitTimeSeconds: 20 # long polling
+      MessageRetentionPeriod: 345600 # 4 days of buffer if workers are down
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+  # Both queues reject unencrypted (non-TLS) requests.
+  DeadLetterQueuePolicy:
+    Type: AWS::SQS::QueueInlinePolicy
+    Properties:
+      Queue: !Ref DeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource: !GetAtt DeadLetterQueue.Arn
+            Condition:
+              Bool: { aws:SecureTransport: 'false' }
+
+  VoteQueuePolicy:
+    Type: AWS::SQS::QueueInlinePolicy
+    Properties:
+      Queue: !Ref VoteQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource: !GetAtt VoteQueue.Arn
+            Condition:
+              Bool: { aws:SecureTransport: 'false' }
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-alarms'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-votes-dlq-not-empty'
+      AlarmDescription: Ballots failed processing repeatedly and are in the dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt DeadLetterQueue.QueueName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+  BacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-votes-backlog'
+      AlarmDescription: Workers are not keeping up; the dashboard is lagging behind submitted votes.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt VoteQueue.QueueName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: !Ref BacklogAlarmSeconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+Outputs:
+  VoteQueueUrl:
+    Value: !Ref VoteQueue
+    Export: { Name: !Sub '${ProjectName}-${Environment}-VoteQueueUrl' }
+  VoteQueueArn:
+    Value: !GetAtt VoteQueue.Arn
+    Export: { Name: !Sub '${ProjectName}-${Environment}-VoteQueueArn' }
+  VoteQueueName:
+    Value: !GetAtt VoteQueue.QueueName
+    Export: { Name: !Sub '${ProjectName}-${Environment}-VoteQueueName' }
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue

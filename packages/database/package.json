@@ -1,0 +1,32 @@
+{
+  "name": "@questionnaire/database",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MySQL schema (TypeORM entities and migrations) shared by the backend services",
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migration:run": "node dist/migrate.js"
+  },
+  "dependencies": {
+    "@questionnaire/shared": "0.1.0",
+    "mysql2": "^3.24.4",
+    "reflect-metadata": "^0.2.2",
+    "typeorm": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.17.2",
+    "typescript": "~6.0.3"
+  }
+}

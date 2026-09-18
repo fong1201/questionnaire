@@ -1,0 +1,36 @@
+{
+  "name": "@questionnaire/vote-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Consumes ballots from the vote queue and writes raw rows and aggregates to MySQL",
+  "scripts": {
+    "build": "nest build",
+    "start": "node dist/main.js",
+    "start:dev": "nest start --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.890.0",
+    "@nestjs/common": "^12.0.3",
+    "@nestjs/config": "^12.0.0",
+    "@nestjs/core": "^12.0.3",
+    "@nestjs/platform-express": "^12.0.3",
+    "@nestjs/typeorm": "^12.0.1",
+    "@questionnaire/database": "0.1.0",
+    "@questionnaire/shared": "0.1.0",
+    "mysql2": "^3.24.4",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "typeorm": "^1.1.1"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^12.0.3",
+    "@nestjs/testing": "^12.0.3",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.17.2",
+    "typescript": "~6.0.3",
+    "vitest": "^5.0.1"
+  }
+}
