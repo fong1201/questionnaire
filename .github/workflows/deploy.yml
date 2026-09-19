@@ -27,10 +27,35 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
 
+  # Infrastructure stacks (network, ECR, SQS, Aurora) are only redeployed when something under
+  # infrastructure/ or this workflow changed. Manual runs, new branches and force pushes always
+  # deploy them.
+  changes:
+    name: Detect infrastructure changes
+    runs-on: ubuntu-latest
+    outputs:
+      infra: ${{ steps.diff.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" != "push" ]] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "infra=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$BEFORE" "$GITHUB_SHA" | grep -qE '^(infrastructure/|\.github/workflows/deploy\.yml$)'; then
+            echo "infra=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "infra=false" >> "$GITHUB_OUTPUT"
+          fi
+
   infra:
     name: Infrastructure
     timeout-minutes: 90
-    needs: ci
+    needs: [ci, changes]
+    if: needs.changes.outputs.infra == 'true'
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment || 'dev' }}
     permissions:
@@ -51,7 +76,8 @@ jobs:
   images:
     name: Push ${{ matrix.service }} image
     timeout-minutes: 30
-    needs: infra
+    needs: [ci, infra]
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment || 'dev' }}
     permissions:
@@ -106,6 +132,7 @@ jobs:
     name: Migrate and deploy services
     timeout-minutes: 90
     needs: images
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment || 'dev' }}
     permissions:
@@ -126,6 +153,7 @@ jobs:
     name: Deploy web apps
     timeout-minutes: 45
     needs: backend
+    if: ${{ !cancelled() && !failure() }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment || 'dev' }}
     permissions:
