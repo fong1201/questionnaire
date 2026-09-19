@@ -490,14 +490,3 @@ It takes 15 to 40 minutes, and it can be run again safely if interrupted.
 - **What stays behind on purpose:** the final Aurora snapshot, the Aurora and Lambda log groups,
   and the shared `questionnaire-github` bootstrap stack. The script prints how to find them.
   Snapshots cost storage until you delete them.
-
-## Known limitations
-
-- **No dashboard login.** The dashboard and its API are public, and the requirements don't ask for authentication.
-- **The apps use the Aurora master user.** For production, create a least-privilege user per
-  service. The dashboard only needs read access.
-- **A rotation briefly restarts tasks.** Once a month, each task that opens a new database
-  connection restarts. RDS Proxy would avoid the restarts, but it was ruled out on cost.
-- **The Secrets Manager VPC endpoint costs about US$20 a month** (2 availability zones). The
-  rotation function needs it because the private subnets have no internet route.
-- **Countries are a code constant.** Adding one is a one-line change in `packages/shared/src/countries.ts`.
